@@ -1,0 +1,69 @@
+You are building Mirsa — a hackathon demo web application for Alzheimer's caregivers.
+
+## Project context
+- App name: Mirsa
+- Patient: Robert
+- Primary caregiver: Margaret  
+- Secondary caregiver: Sarah
+- PRD is in PRD.md — read it before making any decisions
+
+## Stack rules — never deviate
+- Next.js 14 App Router only — no Pages Router
+- TypeScript strict mode — zero `any` types, zero suppressions
+- Tailwind CSS for all styling — no inline style objects except where Tailwind cannot reach
+- shadcn/ui for all UI components — do not build from scratch what shadcn provides
+- Supabase for all data — no other database calls
+- Claude claude-sonnet-4-5 for all AI — no other models
+- No authentication — DEMO_MODE=true bypasses all auth checks
+
+## Code quality rules — enforced on every file
+- Every async function has try/catch error handling
+- Every Supabase query checks the error field: `const { data, error } = await supabase...` then `if (error) throw error`
+- Every API route returns a typed NextResponse — no implicit any in response shapes
+- Loading states on every async action — no UI that freezes silently
+- Zero console.log in production code — use proper error handling
+
+## The classifier route is safety-critical
+- Claude returns JSON only: {match: string|null, confidence: number}
+- Confidence < 0.85 always returns null
+- Any non-JSON response always returns null
+- Returned label always validated against the known anchor allowlist
+- No conversation history ever passed to the classifier
+- Any error always returns {match: null, confidence: 0} — never a 500
+
+## Device page rules — iPad Safari
+- Web Speech API requires a user gesture on iOS — always gate behind Start Mirsa button
+- Use voiceschanged event for TTS voice selection — never synchronous getVoices()
+- Use Screen Wake Lock API to prevent screen sleep — re-acquire on visibility change
+- No requestFullscreen() — use PWA manifest + apple-mobile-web-app-capable instead
+- No scrolling, no bounce, no browser chrome visible
+- Landscape optimised
+
+## Design rules
+- Device page background: #0d0d0b
+- Caregiver app background: #faf9f6
+- Accent: #2d9e75 (teal)
+- Alert: #d97706 (amber)
+- Fonts: Lora serif for emotional/display text, DM Sans for UI
+- Border radius: 16px minimum on cards
+- Touch targets: 48px minimum height
+- Max width: 430px on caregiver app
+- Empty states: warm human copy — never "No data found"
+
+## The four demo moments — never break these
+1. Device answers "Where are my keys?" in warm voice with photo surfacing
+2. Caregiver app receives real-time alert within 2 seconds of elevated anchor trigger
+3. Unmatched question → teach-this → device answers immediately (no refresh)
+4. Weekly summary reads as a compassionate letter in Lora serif
+
+## Mirsa never generates content spoken to Robert
+- The classify route returns a key only
+- The device retrieves stored response_text from local anchor cache
+- Claude never speaks as a source of truth about Robert's life
+- This is architectural — enforce it in code, not just in prompts
+
+## Landing page
+The app has a public marketing landing page at `/` (root route).
+It is separate from /demo, /device, and /app.
+It explains Mirsa to anyone who visits the URL — judges, investors, the public.
+It must be visually exceptional — the single most impressive-looking page in the entire project.
