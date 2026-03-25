@@ -1,18 +1,17 @@
 'use client'
 
-import { Suspense, useCallback, useEffect, useRef, useState } from 'react'
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'next/navigation'
+import Fuse from 'fuse.js'
 import { AmbientDisplay } from '@/components/device/AmbientDisplay'
 import { ListeningIndicator } from '@/components/device/ListeningIndicator'
 import { ResponseOverlay } from '@/components/device/ResponseOverlay'
 import { buildReminders, replaceSchedulePlaceholder } from '@/components/device/DailyReminder'
 import { useVoiceListener } from '@/lib/hooks/useVoiceListener'
-import { useRealtimeAlerts } from '@/lib/hooks/useRealtimeAlerts'
-import { useAnchorCache } from '@/lib/hooks/useAnchorCache'
-import { useOfflineQueue } from '@/lib/hooks/useOfflineQueue'
 import { initVoices, speak, stopSpeaking } from '@/lib/tts/speak'
-import { supabase } from '@/lib/supabase/client'
 import type { Anchor, ClassifyResponse, DailySchedule, Patient, CaregiverProfile, ResponseType } from '@/types'
+
+const ANCHOR_POLL_INTERVAL = 15_000
 
 function getFallbackPhrases(patientName: string, caregiverName: string) {
   return {
@@ -29,86 +28,129 @@ function MyDeviceInner() {
 
   const [patient, setPatient] = useState<Patient | null>(null)
   const [caregiver, setCaregiver] = useState<CaregiverProfile | null>(null)
+  const [anchors, setAnchors] = useState<Anchor[]>([])
+  const [schedule, setSchedule] = useState<DailySchedule | null>(null)
   const [loadError, setLoadError] = useState('')
   const [started, setStarted] = useState(false)
   const [muted, setMuted] = useState(false)
   const [responseText, setResponseText] = useState<string | null>(null)
   const [responsePhoto, setResponsePhoto] = useState<string | null>(null)
-  const [schedule, setSchedule] = useState<DailySchedule | null>(null)
   const [isProcessing, setIsProcessing] = useState(false)
+  const [isOnline, setIsOnline] = useState(true)
   const wakeLockRef = useRef<WakeLockSentinel | null>(null)
+  const anchorsRef = useRef<Anchor[]>([])
+  const pollRef = useRef<NodeJS.Timeout | null>(null)
 
   const patientId = patient?.id ?? ''
   const patientName = patient?.name ?? ''
   const caregiverName = caregiver?.full_name ?? 'your caregiver'
 
-  const { anchors, fuzzyMatch, refreshCache } = useAnchorCache(patientId)
-  const { updatedAnchors, isConnected } = useRealtimeAlerts(patientId)
-  const { isOnline, enqueue } = useOfflineQueue()
+  useEffect(() => {
+    anchorsRef.current = anchors
+  }, [anchors])
+
+  const loadDeviceData = useCallback(async (deviceToken: string) => {
+    try {
+      const res = await fetch(`/api/device/init?token=${encodeURIComponent(deviceToken)}`)
+      const data = await res.json()
+
+      if (data.error === 'not_found') {
+        setLoadError('This device link is not recognised. Please check the URL or contact your caregiver to resend it.')
+        return
+      }
+      if (data.error === 'no_token') {
+        setLoadError('To set up this device, please open your caregiver app and go to Device to find your device link.')
+        return
+      }
+      if (data.error || !data.patient) {
+        setLoadError('Something went wrong loading this device. Please try again.')
+        return
+      }
+
+      setPatient(data.patient)
+      setCaregiver(data.caregiver)
+      setAnchors(data.anchors ?? [])
+      setSchedule(data.schedule)
+
+      try {
+        localStorage.setItem('mirsa_anchor_cache', JSON.stringify(data.anchors ?? []))
+      } catch {
+        // localStorage unavailable
+      }
+    } catch {
+      setLoadError('Could not connect to Mirsa. Please check your internet connection and try again.')
+    }
+  }, [])
 
   useEffect(() => {
     if (!token) {
-      setLoadError('No device token found. Open this page from your dashboard.')
+      setLoadError('To set up this device, please open your caregiver app and go to Device to find your device link.')
       return
     }
-
-    async function loadPatient() {
-      try {
-        const { data: patientData, error: patErr } = await supabase
-          .from('patients')
-          .select('*')
-          .eq('device_token', token)
-          .single()
-
-        if (patErr) throw patErr
-        const pat = patientData as Patient
-        setPatient(pat)
-
-        const { data: cgData } = await supabase
-          .from('caregiver_profiles')
-          .select('*')
-          .eq('patient_id', pat.id)
-          .eq('role', 'owner')
-          .limit(1)
-          .single()
-
-        if (cgData) setCaregiver(cgData as CaregiverProfile)
-      } catch {
-        setLoadError('Could not find a device with this link. Check the URL and try again.')
-      }
-    }
-
-    loadPatient()
-  }, [token])
+    loadDeviceData(token)
+  }, [token, loadDeviceData])
 
   useEffect(() => {
-    if (updatedAnchors.length > 0) {
-      refreshCache()
+    if (!token || !patient) return
+
+    pollRef.current = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/device/init?token=${encodeURIComponent(token)}`)
+        const data = await res.json()
+        if (data.anchors) {
+          setAnchors(data.anchors)
+          try {
+            localStorage.setItem('mirsa_anchor_cache', JSON.stringify(data.anchors))
+          } catch { /* ignore */ }
+        }
+        if (data.schedule) setSchedule(data.schedule)
+      } catch {
+        // Poll failed — will retry
+      }
+    }, ANCHOR_POLL_INTERVAL)
+
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current)
     }
-  }, [updatedAnchors, refreshCache])
+  }, [token, patient])
 
   useEffect(() => {
-    if (!patientId) return
-
-    async function loadSchedule() {
-      try {
-        const today = new Date().toISOString().split('T')[0]
-        const { data, error } = await supabase
-          .from('daily_schedules')
-          .select('*')
-          .eq('patient_id', patientId)
-          .eq('schedule_date', today)
-          .single()
-
-        if (error && error.code !== 'PGRST116') throw error
-        if (data) setSchedule(data as DailySchedule)
-      } catch {
-        // Schedule unavailable
-      }
+    const handleOnline = () => setIsOnline(true)
+    const handleOffline = () => setIsOnline(false)
+    window.addEventListener('online', handleOnline)
+    window.addEventListener('offline', handleOffline)
+    setIsOnline(navigator.onLine)
+    return () => {
+      window.removeEventListener('online', handleOnline)
+      window.removeEventListener('offline', handleOffline)
     }
+  }, [])
 
-    loadSchedule()
-  }, [patientId])
+  const fuzzyMatch = useMemo(() => {
+    return (query: string): { anchor: Anchor; score: number } | null => {
+      const currentAnchors = anchorsRef.current
+      if (currentAnchors.length === 0) return null
+
+      const searchItems = currentAnchors.flatMap(anchor =>
+        anchor.question_examples.map(example => ({ example, anchor }))
+      )
+
+      const fuse = new Fuse(searchItems, {
+        keys: ['example'],
+        threshold: 0.4,
+        includeScore: true,
+      })
+
+      const results = fuse.search(query)
+      if (results.length === 0 || results[0].score === undefined) return null
+
+      const best = results[0]
+      const confidence = 1 - (best.score ?? 1)
+      if (confidence < 0.6) return null
+
+      return { anchor: best.item.anchor, score: confidence }
+    }
+  }, [anchors]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const fallbackPhrases = getFallbackPhrases(patientName, caregiverName)
 
@@ -121,20 +163,26 @@ function MyDeviceInner() {
       deliveredText: string,
       alertTriggered: boolean
     ) => {
-      const interaction = {
-        patient_id: patientId,
-        transcription,
-        matched_anchor_id: matchedAnchor?.id ?? null,
-        classifier_confidence: confidence,
-        response_type: responseType,
-        response_text_delivered: deliveredText,
-        is_flagged: false,
-        caregiver_note: null,
-        alert_triggered: alertTriggered,
-        occurred_at: new Date().toISOString(),
+      try {
+        await fetch('/api/device/interaction', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            patient_id: patientId,
+            transcription,
+            matched_anchor_id: matchedAnchor?.id ?? null,
+            classifier_confidence: confidence,
+            response_type: responseType,
+            response_text_delivered: deliveredText,
+            is_flagged: false,
+            caregiver_note: null,
+            alert_triggered: alertTriggered,
+            occurred_at: new Date().toISOString(),
+          }),
+        })
+      } catch {
+        // Interaction logging failed — device continues working
       }
-
-      enqueue(interaction)
 
       if (alertTriggered && matchedAnchor) {
         try {
@@ -153,14 +201,13 @@ function MyDeviceInner() {
         }
       }
     },
-    [enqueue, patientId, patientName]
+    [patientId, patientName]
   )
 
   const deliverResponse = useCallback(
     async (text: string, photoUrl: string | null) => {
       setResponseText(text)
       setResponsePhoto(photoUrl)
-
       try {
         await speak(text)
       } catch {
@@ -178,15 +225,16 @@ function MyDeviceInner() {
       try {
         let matchedAnchor: Anchor | null = null
         let confidence: number | null = null
+        const currentAnchors = anchorsRef.current
 
-        if (isOnline && anchors.length > 0) {
+        if (isOnline && currentAnchors.length > 0) {
           try {
             const res = await fetch('/api/classify', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 transcript,
-                anchors: anchors.map(a => ({
+                anchors: currentAnchors.map(a => ({
                   label: a.label,
                   question_examples: a.question_examples,
                 })),
@@ -197,7 +245,7 @@ function MyDeviceInner() {
             confidence = result.confidence
 
             if (result.match) {
-              matchedAnchor = anchors.find(a => a.label === result.match) ?? null
+              matchedAnchor = currentAnchors.find(a => a.label === result.match) ?? null
             }
           } catch {
             // Classifier failed — fall through to Fuse.js
@@ -244,7 +292,7 @@ function MyDeviceInner() {
         setIsProcessing(false)
       }
     },
-    [isProcessing, isOnline, anchors, fuzzyMatch, schedule, deliverResponse, logInteraction, fallbackPhrases]
+    [isProcessing, isOnline, fuzzyMatch, schedule, deliverResponse, logInteraction, fallbackPhrases]
   )
 
   const handleCaregiverName = useCallback(async () => {
@@ -413,7 +461,7 @@ function MyDeviceInner() {
         </div>
       )}
 
-      {(!isOnline || !isConnected) && (
+      {!isOnline && (
         <div className="fixed top-8 right-8 z-40 flex items-center gap-2">
           <div className="w-3 h-3 rounded-full bg-mirsa-amber" />
           <span className="font-sans text-xs text-mirsa-amber">Offline</span>
